@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "alexein-ai": {
+      "url": "https://api.alexein.ai/v1/mcp"
+    }
+  }
+}

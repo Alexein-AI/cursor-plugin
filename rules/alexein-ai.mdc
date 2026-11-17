@@ -1,0 +1,12 @@
+---
+description: When to search and save Alexein AI memory
+alwaysApply: false
+---
+
+Alexein AI holds what the user has chosen to remember across sessions and apps.
+
+- Before answering something that depends on what the user said before (their preferences, projects, people or past
+  decisions), call `memory_search`. Open a result with `memory_open` when you need its full text.
+- When the user states a lasting fact, preference or decision, save it with `memory_add`, in one short sentence.
+- Don't save secrets (passwords, keys, tokens), or one-off chatter that won't matter next time.
+- If you're unsure how the user wants memory handled, call `memory_how_they_work`.
