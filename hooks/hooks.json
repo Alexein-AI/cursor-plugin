@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "python3 \"$CURSOR_PLUGIN_ROOT/scripts/alexein_hooks.py\" run cursor session-start",
+        "timeout": 10
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "python3 \"$CURSOR_PLUGIN_ROOT/scripts/alexein_hooks.py\" run cursor prompt",
+        "timeout": 10
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "python3 \"$CURSOR_PLUGIN_ROOT/scripts/alexein_hooks.py\" run cursor tool",
+        "timeout": 5
+      }
+    ],
+    "postToolUseFailure": [
+      {
+        "command": "python3 \"$CURSOR_PLUGIN_ROOT/scripts/alexein_hooks.py\" run cursor tool-failed",
+        "timeout": 5
+      }
+    ],
+    "afterAgentResponse": [
+      {
+        "command": "python3 \"$CURSOR_PLUGIN_ROOT/scripts/alexein_hooks.py\" run cursor reply",
+        "timeout": 5
+      }
+    ],
+    "stop": [
+      {
+        "command": "python3 \"$CURSOR_PLUGIN_ROOT/scripts/alexein_hooks.py\" run cursor stop",
+        "timeout": 10
+      }
+    ],
+    "preCompact": [
+      {
+        "command": "python3 \"$CURSOR_PLUGIN_ROOT/scripts/alexein_hooks.py\" run cursor flush",
+        "timeout": 10
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "python3 \"$CURSOR_PLUGIN_ROOT/scripts/alexein_hooks.py\" run cursor flush",
+        "timeout": 5
+      }
+    ]
+  }
+}
