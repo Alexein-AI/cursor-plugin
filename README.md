@@ -4,8 +4,17 @@ Gives Cursor your [Alexein](https://alexein.ai) memory: the agent searches what 
 answering, and saves new facts as you work, so the next session, and your other apps, pick up where this one left off.
 
 The plugin adds one MCP server, `alexein-ai`, at `https://api.alexein.ai/v1/mcp`, and a rule, `alexein-ai`, that tells
-the agent when to search and when to save. The full tool list is at
+the agent when to search and when to save, and hooks that bring memory into each session and save it as you work
+(below). The full tool list is at
 [docs.alexein.ai/mcp/tools](https://docs.alexein.ai/mcp/tools).
+
+## One memory across your AI tools
+
+Alexein is your own memory, not Cursor's. Connect it to the other AI tools you use too (Claude, ChatGPT, GitHub
+Copilot, Antigravity and more) and they all share it: a preference you mention in one, a decision you make in
+another, or a detail about your project is there in Cursor the next time it matters, and the other way round. It
+also holds what you chose to connect to Alexein, such as Slack, GitHub or email, so answers can come from your
+team's conversations and past decisions, not only this chat.
 
 ## Install
 
