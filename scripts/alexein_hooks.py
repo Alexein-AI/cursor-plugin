@@ -26,6 +26,7 @@ a batch that is not accepted stays in `outbox/` and goes with the next session s
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -115,6 +116,18 @@ FILE_TOOLS = {
 }
 SHELL_TOOLS = {"Bash", "bash", "Shell", "shell", "run_shell_command", "run_command", "exec"}
 PATCH_TOOLS = {"apply_patch"}
+# The memory tools that read: an exchange that used one, or had the first search's results, may
+# only restate what memory already holds, and its reply is not saved back (stop()). Matched at the
+# end of the agent's name for the tool (Claude Code's mcp__plugin_alexein_alexein__memory_search).
+MEMORY_READS = {
+    "memory_search",
+    "memory_open",
+    "memory_subject",
+    "memory_latest",
+    "memory_pending",
+    "memory_how_they_work",
+    "memory_summary",
+}
 FILE_KEYS = ("file_path", "notebook_path", "path", "filePath", "target_file", "TargetFile")
 COMMAND_KEYS = ("command", "CommandLine", "cmd")
 
@@ -306,11 +319,12 @@ class Config:
         self.api_ok = _usable_api(self.api)
         named = _first(*(env.get(name) for name in self.host.data))
         self.data = Path(data or named or _default_data(host))
+        self.refused = _refusal(self)
 
     @property
     def online(self) -> bool:
-        """Whether this run may call the API at all."""
-        return bool(self.key) and self.api_ok
+        """Whether this run may call the API at all: not with a key the API has refused."""
+        return bool(self.key) and self.api_ok and not self.refused
 
     @property
     def paused(self) -> bool:
@@ -402,6 +416,30 @@ def try_lock(path: Path):
     except OSError:
         handle.close()
         return None
+
+
+def _fingerprint(key: str) -> str:
+    """Which key, never the key: enough to tell a refused key from the one that replaced it."""
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
+def _refusal(cfg: Config) -> dict[str, Any] | None:
+    """When the API refused this key (401), and how; None for a key it has not refused."""
+    if not cfg.key:
+        return None
+    refused = _read_json(cfg.data / "refused.json", None)
+    if isinstance(refused, dict) and refused.get("key") == _fingerprint(cfg.key):
+        return refused
+    return None
+
+
+def key_refused(cfg: Config, status: int, detail: str) -> None:
+    """The API said the key is not one it accepts (revoked, or never issued): it is not tried
+    again, and nothing is recorded to send with it, until the key is replaced; status says so."""
+    refused = {"at": _now(), "status": status, "detail": detail, "key": _fingerprint(cfg.key)}
+    _write_json(cfg.data / "refused.json", refused)
+    cfg.refused = refused
+    _write_status(cfg)
 
 
 def log_error(cfg: Config | None, what: str) -> None:
@@ -538,6 +576,11 @@ def _write_status(cfg: Config) -> None:
         "capture": cfg.capture,
         "api_url": cfg.api,
         "api_url_usable": cfg.api_ok,
+        "key_refused": (
+            {"at": cfg.refused.get("at"), "status": cfg.refused.get("status")}
+            if cfg.refused
+            else None
+        ),
         "version": VERSION,
         "seen_at": _now(),
     }
@@ -625,12 +668,16 @@ def prompt(cfg: Config, hook: dict[str, Any]) -> dict[str, Any] | None:
     context = recall(cfg, said.strip())
     if not context:
         return None
-    if not cfg.host.prompt_context:
-        # Its prompt hook cannot add context: the next tool result carries it (tool()).
+    if cfg.capture or not cfg.host.prompt_context:
         with _Lock(lock_path):
             state = _load(state_path)
-            state["pending"] = context
+            if cfg.capture:
+                state["recalled"] = True  # this exchange's reply may restate memory (stop())
+            if not cfg.host.prompt_context:
+                # Its prompt hook cannot add context: the next tool result carries it (tool()).
+                state["pending"] = context
             _write_json(state_path, state)
+    if not cfg.host.prompt_context:
         return None
     return {
         "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}
@@ -659,6 +706,8 @@ def recall(cfg: Config, query: str) -> str:
     if "error" in found:
         log_error(cfg, f"recall: {found['error']}")
         return ""
+    if found.get("status") == 401:
+        key_refused(cfg, 401, _detail(found.get("answer")))
     if found.get("status") != 200 or not isinstance(found.get("answer"), dict):
         log_error(cfg, f"recall: HTTP {found.get('status')}")
         return ""
@@ -729,7 +778,10 @@ def tool(cfg: Config, hook: dict[str, Any], failed: bool) -> str:
     given = hook.get("tool_input") if isinstance(hook.get("tool_input"), dict) else {}
     cwd = str(hook.get("cwd") or "")
     entries = []
-    if name in FILE_TOOLS:
+    read = re.search(r"(?:^|[_:./\-])(memory_[a-z_]+)$", name)
+    if read and read.group(1) in MEMORY_READS:
+        entries = [{"kind": "memory", "what": read.group(1)}]
+    elif name in FILE_TOOLS:
         target = str(_first(*(given.get(k) for k in FILE_KEYS)) or "")
         entries = [_file_entry(target, cwd, failed)] if target else []
     elif name in PATCH_TOOLS:
@@ -800,7 +852,7 @@ def work_line(entries: list[dict[str, Any]]) -> str:
         if not isinstance(entry, dict):
             continue
         what = str(entry.get("what") or "")
-        if not what:
+        if not what or entry.get("kind") not in ("file", "command"):
             continue
         held = files if entry.get("kind") == "file" else commands
         held.pop(what, None)
@@ -876,9 +928,19 @@ def stop(cfg: Config, hook: dict[str, Any]) -> None:
             user = user or strip_secrets(last_user)[:TURN_CHARS]
             reply = reply or last_reply
         reply = strip_secrets(reply.strip())[:TURN_CHARS]
-        work = work_line(_read_work(work_path))
+        entries = _read_work(work_path)
+        work = work_line(entries)
         _drop(work_path)
         state["prompt"] = None
+        recalled = state.pop("recalled", False) or any(
+            isinstance(e, dict) and e.get("kind") == "memory" for e in entries
+        )
+        if recalled and not work:
+            # A question answered from memory, with nothing done: saved back, the answer came
+            # back later as new evidence for what memory already held, and the question alone
+            # ahead of the fact in the next session's first recall. Neither is saved; anything
+            # new said with it is the agent's to keep with memory_add (the session lines).
+            user = reply = ""
         if not user and not reply:
             _write_json(state_path, state)
             return
@@ -1133,6 +1195,8 @@ def send(cfg: Config) -> int:
                 _reject(cfg, claimed, f"HTTP {status}: {_detail(answer)}")
             else:
                 _keep(cfg, claimed, batch, f"HTTP {status}: {_detail(answer)}")
+                if status == 401:
+                    key_refused(cfg, status, _detail(answer))
                 break
     finally:
         holder.close()
@@ -1225,24 +1289,33 @@ def status(cfg: Config) -> str:
     rejected = len(list(cfg.dir("rejected").glob("*.json")))
     last = _read_json(cfg.data / "last_send.json", {})
 
+    where = (
+        "/plugin > Installed > alexein > Configure options"
+        if cfg.host.id == CLAUDE
+        else f"ALEXEIN_API_KEY, or api_key in {SETTINGS}"
+    )
+    refused = shown.get("key_refused") if isinstance(shown.get("key_refused"), dict) else None
+    saving = "on" if shown.get("capture", True) else "off (the capture option)"
     if "key_set" not in shown:
         key = "unknown until the next session starts"
-    elif shown["key_set"]:
-        key = "set"
-    else:
-        where = (
-            "/plugin > Installed > alexein > Configure options"
-            if cfg.host.id == CLAUDE
-            else f"ALEXEIN_API_KEY, or api_key in {SETTINGS}"
-        )
+    elif not shown["key_set"]:
         key = (
             "not set. Memory tools still work through sign-in; recall at the start of a session"
             f" and saving sessions need a key ({where})"
         )
+        saving = "off (needs an API key)"
+    elif refused:
+        key = (
+            f"refused (HTTP {refused.get('status')}) at {refused.get('at')}: it was revoked or is"
+            f" not a key Alexein issued. Make a new one under My memory › Keys and set it ({where})"
+        )
+        saving = "off until the key is replaced; what waits is kept and sent with the new key"
+    else:
+        key = "set"
     lines = [
         f"Alexein for {cfg.host.name}",
         f"- API key: {key}",
-        f"- Saving sessions: {'on' if shown.get('capture', True) else 'off (the capture option)'}",
+        f"- Saving sessions: {saving}",
         f"- Paused: {f'yes ({_resume_how(cfg)} turns it back on)' if cfg.paused else 'no'}",
         f"- Exchanges waiting to be sent: {waiting + recording}"
         + (
