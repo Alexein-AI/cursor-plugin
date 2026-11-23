@@ -1,7 +1,7 @@
 {
   "name": "alexein-ai",
   "displayName": "Alexein AI",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Your personal memory, shared across Cursor, Claude, ChatGPT, Copilot and your other AI tools: Cursor searches what you have told any of them and saves new facts.",
   "author": {
     "name": "Alexein AI",
