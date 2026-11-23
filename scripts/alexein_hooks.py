@@ -936,9 +936,11 @@ def stop(cfg: Config, hook: dict[str, Any]) -> None:
             isinstance(e, dict) and e.get("kind") == "memory" for e in entries
         )
         if recalled and not work:
-            # An answer drawn from memory, with nothing done: saved back, it would come back
-            # later as new evidence for what memory already holds. What they asked is kept.
-            reply = ""
+            # A question answered from memory, with nothing done: saved back, the answer came
+            # back later as new evidence for what memory already held, and the question alone
+            # ahead of the fact in the next session's first recall. Neither is saved; anything
+            # new said with it is the agent's to keep with memory_add (the session lines).
+            user = reply = ""
         if not user and not reply:
             _write_json(state_path, state)
             return
