@@ -498,6 +498,17 @@ class Config:
         return bool(self.key) and self.api_ok and not self.refused and self.key_kind == "personal"
 
     @property
+    def checking(self) -> bool:
+        """A key the API has not yet said is personal (it could not be asked): nothing is looked
+        up or sent with it, and the exchanges are kept on this computer meanwhile."""
+        return bool(self.key) and self.api_ok and not self.refused and self.key_kind is None
+
+    @property
+    def recording(self) -> bool:
+        """Whether exchanges are recorded: with a personal key, or one still being checked."""
+        return self.online or self.checking
+
+    @property
     def paused(self) -> bool:
         return (self.data / "paused").exists()
 
@@ -752,6 +763,7 @@ def _write_status(cfg: Config) -> None:
         "key_set": bool(cfg.key),
         "key_source": cfg.key_source,
         "key_project": cfg.project_key,
+        "key_checking": cfg.checking,
         "capture": cfg.capture,
         "api_url": cfg.api,
         "api_url_usable": cfg.api_ok,
@@ -780,10 +792,12 @@ def session_start(cfg: Config, hook: dict[str, Any]) -> tuple[str, str]:
     lines say recall is off and how to turn it on, and the first session start of a day opens
     the browser sign-in (`auto_sign_in`)."""
     _write_status(cfg)
-    if cfg.online and not cfg.paused:
+    if cfg.recording and not cfg.paused:
         _sweep(cfg, _session_name(hook))
-        if _outbox_waiting(cfg):
+        if cfg.online and _outbox_waiting(cfg):
             spawn_sender(cfg)
+    if cfg.checking and not cfg.paused and cfg.host.lines:
+        return LINES + "\n" + CHECKING_LINE, ""
     if not cfg.signed_out or cfg.paused:
         return (LINES if cfg.host.lines else ""), ""
     opened = auto_sign_in(cfg, hook)
@@ -796,6 +810,13 @@ def session_start(cfg: Config, hook: dict[str, Any]) -> tuple[str, str]:
             f" browser window that just opened; {_sign_in_how(cfg)} opens it again."
         )
     return LINES + "\n" + _off_line(cfg), told
+
+
+CHECKING_LINE = (
+    "- Automatic recall is waiting: Alexein could not yet be reached to confirm the plugin's key,"
+    " so nothing is looked up on its own until it is (the memory tools still work). Exchanges are"
+    " kept on this computer and saved once it is confirmed."
+)
 
 
 def _off_line(cfg: Config) -> str:
@@ -842,7 +863,7 @@ def _sweep(cfg: Config, current: str) -> None:
 
 def prompt(cfg: Config, hook: dict[str, Any]) -> dict[str, Any] | None:
     _write_status(cfg)
-    if not cfg.online or cfg.paused:
+    if not cfg.recording or cfg.paused:
         return None
     said = str(hook.get("prompt") or "")
     command = said.lstrip().startswith("/")
@@ -866,13 +887,16 @@ def prompt(cfg: Config, hook: dict[str, Any]) -> dict[str, Any] | None:
                     "additionalContext": waiting,
                 }
             }
-        first = not state.get("searched") and not command
+        # With the key still being checked, nothing is looked up: the session's first search
+        # waits for a prompt after it is confirmed.
+        first = not state.get("searched") and not command and cfg.online
         if first:
             state["searched"] = True
         # ALEXEIN_RECALL_EVERY_PROMPT: a later prompt that is a question or a task, on a topic
         # the last search did not cover, is looked up too.
         again = bool(
             cfg.recall_every
+            and cfg.online
             and not first
             and not command
             and state.get("searched")
@@ -1467,7 +1491,7 @@ def ask_catch(cfg: Config, hook: dict[str, Any]) -> str:
 def tool(cfg: Config, hook: dict[str, Any], failed: bool) -> str:
     """Notes the file or command; returns the first search's results where they wait for a tool
     result to go with (Host.prompt_context), else ""."""
-    if not cfg.online or cfg.paused:
+    if not cfg.recording or cfg.paused:
         return ""
     failed = failed or bool(hook.get("tool_failed"))
     sid = _session_name(hook)
@@ -1548,7 +1572,7 @@ def _take_pending(cfg: Config, sid: str) -> str:
 
 def reply(cfg: Config, hook: dict[str, Any]) -> None:
     # Kept for the stop's record (capture) and for its question check (ALEXEIN_ASK_CATCH).
-    if cfg.paused or not ((cfg.online and cfg.capture) or cfg.ask_catch):
+    if cfg.paused or not ((cfg.recording and cfg.capture) or cfg.ask_catch):
         return
     text = str(hook.get("last_assistant_message") or "").strip()
     if not text:
@@ -1611,7 +1635,7 @@ def _read_work(path: Path) -> list[dict[str, Any]]:
 
 
 def stop(cfg: Config, hook: dict[str, Any]) -> None:
-    if not cfg.online or cfg.paused or not cfg.capture:
+    if not cfg.recording or cfg.paused or not cfg.capture:
         return
     sid = _session_name(hook)
     state_path, work_path, lock_path = _paths(cfg, sid)
@@ -1663,20 +1687,22 @@ def stop(cfg: Config, hook: dict[str, Any]) -> None:
             return
         sequence = int(state.get("seq") or 0) + 1
         state["seq"] = sequence
-        state.setdefault("exchanges", []).append(
-            {
-                "n": sequence,
-                "user": user or "",
-                "user_at": state.get("prompt_at") or _now(),
-                "assistant": reply,
-                "assistant_at": _now(),
-                "work": work,
-            }
-        )
+        exchange = {
+            "n": sequence,
+            "user": user or "",
+            "user_at": state.get("prompt_at") or _now(),
+            "assistant": reply,
+            "assistant_at": _now(),
+            "work": work,
+        }
+        if cfg.checking:
+            # Sent only once this key is confirmed personal, dropped if it is not (`send`).
+            exchange["unchecked"] = _fingerprint(cfg.key)
+        state.setdefault("exchanges", []).append(exchange)
         state["cwd"] = str(hook.get("cwd") or state.get("cwd") or "")
         _write_json(state_path, state)
         due = len(state["exchanges"]) >= BATCH
-    if due and _batch(cfg, sid):
+    if due and _batch(cfg, sid) and cfg.online:
         spawn_sender(cfg)
 
 
@@ -1760,9 +1786,11 @@ def _batch(cfg: Config, sid: str) -> bool:
         first, last = exchanges[0].get("n"), exchanges[-1].get("n")
         name = f"{cfg.host.batch}-{sid}-{first}-{last}"
         body = add_body(sid, exchanges, str(state.get("cwd") or ""), cfg.host)
-        _write_json(
-            cfg.dir("outbox") / f"{name}.json", {"id": name, "made_at": _now(), "body": body}
-        )
+        batch: dict[str, Any] = {"id": name, "made_at": _now(), "body": body}
+        unchecked = sorted({str(e["unchecked"]) for e in exchanges if e.get("unchecked")})
+        if unchecked:
+            batch["unchecked"] = unchecked
+        _write_json(cfg.dir("outbox") / f"{name}.json", batch)
         state["exchanges"] = []
         _write_json(state_path, state)
     return True
@@ -1833,10 +1861,10 @@ def _outbox_waiting(cfg: Config) -> bool:
 def flush(cfg: Config, hook: dict[str, Any]) -> None:
     """PreCompact and SessionEnd: what this session has not sent, sent now. SessionEnd's hooks
     share a budget of 1.5 seconds, so the send is handed to its own process."""
-    if not cfg.online or cfg.paused:
+    if not cfg.recording or cfg.paused:
         return
     made = cfg.capture and _batch(cfg, _session_name(hook))
-    if made or _outbox_waiting(cfg):
+    if (made or _outbox_waiting(cfg)) and cfg.online:
         spawn_sender(cfg)
 
 
@@ -1894,6 +1922,14 @@ def send(cfg: Config) -> int:
             if _age_days(batch) > OUTBOX_DAYS:
                 _reject(cfg, claimed, "too old")
                 continue
+            verdict = _recorded_with(cfg, batch)
+            if verdict == "wait":
+                os.replace(claimed, path)  # its key is not checked yet: kept, not sent
+                continue
+            if verdict == "drop":
+                _drop(claimed)
+                log_error(cfg, f"send {batch.get('id')}: recorded with a key that is not personal; dropped")
+                continue
             try:
                 status, answer = _request(
                     cfg, "/v2/memory/add", batch["body"], SEND_TIMEOUT, str(batch.get("id") or "")
@@ -1918,6 +1954,26 @@ def send(cfg: Config) -> int:
     finally:
         holder.close()
     return accepted
+
+
+def _recorded_with(cfg: Config, batch: dict[str, Any]) -> str:
+    """For a batch recorded while its key was being checked: "send" once every such key is
+    confirmed personal, "drop" when one is confirmed not to be, "wait" while one is unknown."""
+    marks = batch.get("unchecked") if isinstance(batch.get("unchecked"), list) else []
+    if not marks:
+        return "send"
+    kinds = _read_json(cfg.data / KINDS, {})
+    kinds = kinds if isinstance(kinds, dict) else {}
+    allowed = str(cfg.env.get("ALEXEIN_HOOKS_PROJECT") or "").strip()
+    verdict = "send"
+    for mark in marks:
+        entry = kinds.get(str(mark)) if isinstance(kinds.get(str(mark)), dict) else {}
+        kind = str(entry.get("kind") or "")
+        if not kind:
+            verdict = "wait"
+        elif kind != "personal" and not (allowed and kind == f"project:{allowed}"):
+            return "drop"
+    return verdict
 
 
 def _mtime(path: Path) -> float:
@@ -2095,8 +2151,11 @@ def sign_in(cfg: Config) -> str:
     if _in_flight(cfg):
         return "A sign-in is already open in your browser. Finish it there, or wait a few minutes."
     cfg.data.mkdir(parents=True, exist_ok=True, mode=0o700)
+    before = _read_json(cfg.data / SIGN_IN_STATE, {})
+    tries = int(before.get("auto_tries") or 0) if isinstance(before, dict) else 0
     _write_json(
-        cfg.data / SIGN_IN_STATE, {"opened_at": _now(), "by": "asked", "console": console}
+        cfg.data / SIGN_IN_STATE,
+        {"opened_at": _now(), "by": "asked", "console": console, "auto_tries": tries},
     )
     spawn_helper(cfg, "sign-in-helper")
     return (
@@ -2393,6 +2452,12 @@ def status(cfg: Config) -> str:
         )
         saving = "off (needs a personal key or a sign-in)"
         shown = {**shown, "key_set": False}
+    elif shown.get("key_checking") and not kept:
+        key = (
+            "set, not yet confirmed as a personal key: Alexein could not be reached to check it,"
+            " and it is asked again within minutes"
+        )
+        saving = "waiting: exchanges are kept on this computer and saved once the key is confirmed"
     elif "key_set" not in shown:
         key = "unknown until the next session starts"
     elif not shown["key_set"]:
@@ -2421,6 +2486,8 @@ def status(cfg: Config) -> str:
         key = "set"
     if cfg.paused:
         recall = f"off while paused ({_resume_how(cfg)})"
+    elif shown.get("key_checking") and not kept:
+        recall = "waiting for the key to be confirmed"
     elif shown.get("key_set") and not (refused and "refused" in key):
         recall = "on (the first message of each session" + (
             ", and later messages on a new topic)" if cfg.recall_every else ")"
