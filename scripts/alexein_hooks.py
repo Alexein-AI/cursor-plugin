@@ -50,7 +50,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 DEFAULT_API = "https://api.alexein.ai"
 # A personal key reaches its member's own memory under this app user name (the console's
 # "X-Alexein-User: me").
