@@ -42,12 +42,15 @@ plugin or server, or disconnect Cursor in Alexein under **AI assistants**.
 The plugin also adds hooks (`hooks/hooks.json`) and an always-on rule with the note on how to use the memory tools. Until they are signed in they only keep that rule; nothing is read or sent.
 
 They need the plugin signed in to your Alexein account. The first time a session starts without it, your
-browser opens Alexein's sign-in, where you choose **Allow**; nothing is copied or pasted. If you close it, it
-opens again at most once a day (once a week after **Cancel**), and
+browser opens Alexein's sign-in, where you choose **Allow**; nothing is copied or pasted. If you leave it, it
+opens again at most once a day, three times in all; after **Cancel** it never opens by itself again, and
 `python3 <plugin>/scripts/alexein_hooks.py run cursor sign-in` opens it whenever you like. The key it makes is a
 personal key labelled **Cursor · your computer's name**, listed under **My memory › Keys**, and kept in
 `~/.alexein/hooks/cursor/`, readable only by you. Instead, a key of your own can go in `ALEXEIN_API_KEY` (a personal
-key from **My memory › Keys**, **Read and write**; or `api_key` in `~/.config/alexein/hooks.json`).
+key from **My memory › Keys**, **Read and write**; or `api_key` in `~/.config/alexein/hooks.json`). It is used
+only once Alexein says it is a personal key: a project's key (the one your own app uses) would save your sessions
+to an app user of that project. With a self-hosted `ALEXEIN_API_URL`, the sign-in opens only once
+`ALEXEIN_CONSOLE_URL` names that Alexein's app.
 
 Signed in, or with a key:
 
@@ -59,8 +62,8 @@ Signed in, or with a key:
 
 Three behaviours are off unless their environment variable is `1`, while they are measured: with
 `ALEXEIN_RECALL_EVERY_PROMPT` a later message on a new topic is looked up too; with `ALEXEIN_RECALL_BEFORE_EDIT`
-the first edit of a file brings what memory holds about it with that edit's result (Cursor's before-tool hook can't add context); with `ALEXEIN_ASK_CATCH` a reply that ends by asking you something memory may hold is followed up once, as a message, asking the agent to look first. Each adds only what bears on what was asked, at most
-about 600 tokens, and waits at most 2.5 seconds. `ALEXEIN_SIGN_IN=0` keeps the sign-in from opening on its own.
+the first edit of a file brings what memory holds about it (the search names the file and up to six names from the edit, never the file's contents) with that edit's result (Cursor's before-tool hook can't add context); `ALEXEIN_ASK_CATCH` has no effect in Cursor: its stop hook can only send the agent on with a message in your name. Each adds only what bears on what was asked, at most
+about 600 tokens, and each lookup waits at most 2.5 seconds. `ALEXEIN_SIGN_IN=0` keeps the sign-in from opening on its own.
 
 `python3 <plugin>/scripts/alexein_hooks.py run cursor pause` (or `resume`, `status`) turns this off and on. The
 hooks need `python3`; they are the same script as the Claude Code plugin's

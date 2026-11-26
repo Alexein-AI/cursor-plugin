@@ -155,7 +155,9 @@ class Host:
     none, no browser sign-in. `edit_context`: where what memory holds about a file goes before
     its first edit - "pre" with the edit's own result (Claude Code's PreToolUse), "post" with
     the result of the edit (Cursor, Copilot: their before-tool hooks cannot add context), "next"
-    at the next model call (Antigravity's PreInvocation)."""
+    at the next model call (Antigravity's PreInvocation). `ask_catch`: a reply can be sent back
+    without the agent taking it as the person's words; Cursor submits it as their next message,
+    which would be saved as theirs, so ALEXEIN_ASK_CATCH is ignored there."""
 
     def __init__(
         self,
@@ -168,11 +170,13 @@ class Host:
         batch: str = "",
         client: str = "",
         edit_context: str = "",
+        ask_catch: bool = True,
     ) -> None:
         self.id, self.name, self.data = id, name, data
         self.prompt_context, self.lines = prompt_context, lines
         self.batch = batch or id
         self.client, self.edit_context = client, edit_context
+        self.ask_catch = ask_catch
 
 
 CLAUDE = "claude-code"
@@ -202,6 +206,7 @@ HOSTS = {
             lines=False,
             client="cursor",
             edit_context="post",
+            ask_catch=False,
         ),
         Host("codex", "Codex", data=("PLUGIN_DATA",), client="codex"),
         Host("gemini", "Gemini CLI"),
@@ -356,6 +361,68 @@ def signed_in(data: Path) -> dict[str, str] | None:
 
 
 SIGNED_IN = "signed-in.json"
+KINDS = "key-kind.json"  # what the API said each key is, by fingerprint (never the key)
+KIND_TIMEOUT = 1.5
+KIND_RETRY = 300  # seconds before asking again when the API could not be asked
+PERSONAL_SPACE = re.compile(r"_[a-z0-9]{10}")  # a personal key's project (twin-memory keys.py)
+
+
+def _cached_kind(data: Path, key: str) -> str | None:
+    kinds = _read_json(data / KINDS, {})
+    entry = kinds.get(_fingerprint(key)) if isinstance(kinds, dict) else None
+    return str(entry["kind"]) if isinstance(entry, dict) and entry.get("kind") else None
+
+
+def key_kind(cfg: Config) -> str | None:
+    """What the API says the key is (`GET /v1/me`, free, of the key alone and naming no app
+    user): "personal" for a person's own key, "project:<org>.<project>" for a project's, "service" for the
+    service's secret, "refused" on a 401; None when it could not be asked."""
+    request = urllib.request.Request(cfg.api + "/v1/me", method="GET")
+    request.add_header("Authorization", f"Bearer {cfg.key}")
+    request.add_header("User-Agent", f"alexein-{cfg.host.id}/{VERSION}")
+    try:
+        with urllib.request.urlopen(request, timeout=KIND_TIMEOUT) as response:
+            status, raw = response.status, response.read(64 * 1024)
+    except urllib.error.HTTPError as refused:
+        status, raw = refused.code, b""
+    if status == 401:
+        key_refused(cfg, 401, "")
+        return "refused"
+    try:
+        answer = json.loads(raw.decode("utf-8")) if status == 200 and raw else None
+    except ValueError:
+        answer = None
+    if not isinstance(answer, dict) or not answer.get("kind"):
+        return None
+    if answer.get("kind") != "key":
+        return str(answer["kind"])[:20]
+    project = str(answer.get("project") or "")
+    if PERSONAL_SPACE.fullmatch(project):
+        return "personal"
+    return f"project:{str(answer.get('org') or '')[:40]}.{project[:40]}"
+
+
+def check_key(cfg: Config) -> bool:
+    """A key not yet known asked about once (`key_kind`), and the answer kept; True when it was
+    asked. Within the time a hook may take: a failure is retried after KIND_RETRY."""
+    if not cfg.key or cfg.key_kind or cfg.refused or not cfg.api_ok:
+        return False
+    path, mark = cfg.data / KINDS, _fingerprint(cfg.key)
+    kinds = _read_json(path, {})
+    kinds = kinds if isinstance(kinds, dict) else {}
+    entry = kinds.get(mark) if isinstance(kinds.get(mark), dict) else {}
+    if entry.get("unknown_at") and _since(entry["unknown_at"]) < KIND_RETRY:
+        return False
+    try:
+        kind = key_kind(cfg)
+    except Exception as failed:  # noqa: BLE001 - asked again later
+        log_error(cfg, f"key check: {type(failed).__name__}: {failed}")
+        kind = None
+    if kind == "refused":
+        return True
+    kinds[mark] = {"kind": kind, "at": _now()} if kind else {"unknown_at": _now()}
+    _write_json(path, kinds)
+    return True
 
 
 def _default_data(host: str = CLAUDE) -> Path:
@@ -366,11 +433,14 @@ def _default_data(host: str = CLAUDE) -> Path:
 
 class Config:
     """In Claude Code, the plugin's options as it exports them to a hook
-    (`CLAUDE_PLUGIN_OPTION_<KEY>`), else ALEXEIN_API_KEY and ALEXEIN_API_URL. In any other agent,
-    ALEXEIN_API_KEY, ALEXEIN_CAPTURE and ALEXEIN_API_URL, or else SETTINGS. With no key from
-    any of those, the key a browser sign-in kept (`signed_in`), on the API it was minted for.
-    And the data directory: the agent's plugin data directory where it names one, or a folder of
-    this host's own. The behaviour flags (FLAGS) come from the environment, off unless "1"."""
+    (`CLAUDE_PLUGIN_OPTION_<KEY>`). In any other agent, ALEXEIN_API_KEY, ALEXEIN_CAPTURE and
+    ALEXEIN_API_URL, or else SETTINGS. A key is used only once the API has said it is a personal
+    key (`check_key`): every request names the app user `me`, which for a personal key is the
+    person's own memory and for a project's key would be an app user of that project. With no
+    usable key, the key a browser sign-in kept (`signed_in`), on the API it was minted for, unless
+    another API is configured. And the data directory: the agent's plugin data directory where it
+    names one, or a folder of this host's own. The behaviour flags (FLAGS) come from the
+    environment, off unless "1"."""
 
     def __init__(
         self, env: dict[str, str] | None = None, data: str | None = None, host: str = CLAUDE
@@ -382,10 +452,6 @@ class Config:
             key, capture, api = (
                 env.get(f"CLAUDE_PLUGIN_OPTION_{name}") for name in ("API_KEY", "CAPTURE", "API_URL")
             )
-            # A run with no plugin options (`claude -p --plugin-dir`, a script) names its key as
-            # the other agents do.
-            if not str(key or "").strip():
-                key, api = env.get("ALEXEIN_API_KEY"), api or env.get("ALEXEIN_API_URL")
         else:
             saved = _read_json(SETTINGS, {})
             saved = saved if isinstance(saved, dict) else {}
@@ -396,14 +462,26 @@ class Config:
             api = env.get("ALEXEIN_API_URL") or saved.get("api_url")
         self.key = str(key or "").strip()
         self.capture = _flag(capture, True)
-        self.api = str(api or "").strip().rstrip("/") or DEFAULT_API
+        self.configured_api = str(api or "").strip().rstrip("/")
+        self.api = self.configured_api or DEFAULT_API
         named = _first(*(env.get(name) for name in self.host.data))
         self.data = Path(data or named or _default_data(host))
         self.key_source = "set" if self.key else ""
+        # "personal", another kind (never used), or None until the API is asked (`check_key`).
+        # A project's key is used only where ALEXEIN_HOOKS_PROJECT names that very project
+        # (`<org>.<project>`): a test bench's deliberate choice, never an exported key's accident.
+        self.key_kind = _cached_kind(self.data, self.key) if self.key else None
+        allowed = str(env.get("ALEXEIN_HOOKS_PROJECT") or "").strip()
+        if allowed and self.key_kind == f"project:{allowed}":
+            self.key_kind = "personal"
+        self.project_key = self.key_kind not in (None, "personal")
+        if self.project_key:
+            self.key = ""
         if not self.key:
             kept = signed_in(self.data)
-            if kept:
-                self.key, self.key_source = kept["key"], "sign-in"
+            # A key minted for the hosted API is not sent there in place of a configured one.
+            if kept and self.configured_api in ("", DEFAULT_API, kept["api_url"]):
+                self.key, self.key_source, self.key_kind = kept["key"], "sign-in", "personal"
                 self.api = kept["api_url"]
         self.api_ok = _usable_api(self.api)
         self.refused = _refusal(self)
@@ -411,11 +489,13 @@ class Config:
             str(env.get(name) or "").strip().lower() in {"1", "true", "on", "yes"}
             for name in FLAGS
         )
+        self.ask_catch = self.ask_catch and self.host.ask_catch
 
     @property
     def online(self) -> bool:
-        """Whether this run may call the API at all: not with a key the API has refused."""
-        return bool(self.key) and self.api_ok and not self.refused
+        """Whether this run may call the API at all: with a key the API said is personal, and
+        has not refused."""
+        return bool(self.key) and self.api_ok and not self.refused and self.key_kind == "personal"
 
     @property
     def paused(self) -> bool:
@@ -671,6 +751,7 @@ def _write_status(cfg: Config) -> None:
     shown = {
         "key_set": bool(cfg.key),
         "key_source": cfg.key_source,
+        "key_project": cfg.project_key,
         "capture": cfg.capture,
         "api_url": cfg.api,
         "api_url_usable": cfg.api_ok,
@@ -718,6 +799,13 @@ def session_start(cfg: Config, hook: dict[str, Any]) -> tuple[str, str]:
 
 
 def _off_line(cfg: Config) -> str:
+    if cfg.host.client and not console_url(cfg):
+        return (
+            "- Automatic recall and saving are off: the plugin's hooks have no personal key for"
+            f" {cfg.configured_api or cfg.api} (the memory tools still work). A personal key from"
+            " that Alexein's My memory › Keys turns it on, or ALEXEIN_CONSOLE_URL set to its app"
+            f" and then {_sign_in_how(cfg)}."
+        )
     return (
         "- Automatic recall and saving are off: the plugin's hooks are not signed in to Alexein"
         " (the memory tools still work). If they ask why memory was not looked up on its own,"
@@ -1126,15 +1214,18 @@ def _edit_text(given: dict[str, Any]) -> str:
 
 
 def edit_query(path: str, given: dict[str, Any]) -> tuple[str, set[str], set[str]]:
-    """The search for a file about to be edited: its module, the folders above it and the names
-    the edit writes (never its text); with the path's topic words and the names' apart."""
+    """The search for a file about to be edited: its module, the folders above it and up to
+    EDIT_NAMES identifiers (names) from what the edit writes - not the rest of its text, and
+    never what it replaces; a name over 40 characters or with 4 digits or more is left out, as a
+    value more than a name. Sent only to the person's own memory search. With the path's topic
+    words and the names' apart."""
     parts = [p for p in re.split(r"[\\/]", path) if p and p not in (".", "..")]
     stem = re.sub(r"\.[A-Za-z0-9]+$", "", parts[-1]) if parts else ""
     where = [p for p in parts[-3:-1] if p.lower() not in GENERIC_PATH]
     place = {t for t in _terms(" ".join([stem, *where])) if t not in GENERIC_PATH}
     counts: dict[str, int] = {}
     for name in _IDENT.findall(_edit_text(given)):
-        if name.lower() in STOP or name.isupper() and len(name) < 4:
+        if name.lower() in STOP or len(name) > 40 or sum(c.isdigit() for c in name) >= 4:
             continue
         counts[name] = counts.get(name, 0) + 1
     names = sorted(counts, key=lambda n: (-counts[n], n))[:EDIT_NAMES]
@@ -1879,8 +1970,8 @@ def _reject(cfg: Config, claimed: Path, why: str) -> None:
 DEFAULT_CONSOLE = "https://memory.alexein.ai"
 LOCAL_CONSOLE = "http://localhost:3003"  # a local console, beside a local API
 SIGN_IN_WAIT = 15 * 60  # long enough to make an account and verify its email on the way
-SIGN_IN_EVERY = 86400  # opened by itself at most once a day...
-SIGN_IN_DECLINED = 7 * 86400  # ...and not for a week after Cancel
+SIGN_IN_EVERY = 86400  # opened by itself at most once a day,
+SIGN_IN_TRIES = 3  # left unanswered this many times, or Cancel once, and never again by itself
 EXCHANGE_TIMEOUT = 30
 SIGN_IN_STATE = "sign-in.json"
 
@@ -1892,12 +1983,18 @@ def _sign_in_how(cfg: Config) -> str:
 
 
 def console_url(cfg: Config) -> str:
-    """ALEXEIN_CONSOLE_URL, else the console beside the API: memory.alexein.ai, or a local
-    console beside a local API. "" when it is neither https nor http to this machine."""
+    """ALEXEIN_CONSOLE_URL, else the console beside the API: memory.alexein.ai beside the hosted
+    API, a local console beside a local API. "" for any other API (self-hosted: its console is
+    not known, and the hosted one would mint a key for the hosted API), or an address neither
+    https nor http to this machine."""
     named = str(cfg.env.get("ALEXEIN_CONSOLE_URL") or "").strip().rstrip("/")
     if not named:
-        host = urllib.parse.urlsplit(cfg.api).hostname or ""
-        named = LOCAL_CONSOLE if host in {"localhost", "127.0.0.1", "::1"} else DEFAULT_CONSOLE
+        api = cfg.configured_api or DEFAULT_API
+        host = urllib.parse.urlsplit(api).hostname or ""
+        if host in {"localhost", "127.0.0.1", "::1"}:
+            named = LOCAL_CONSOLE
+        elif api == DEFAULT_API:
+            named = DEFAULT_CONSOLE
     return named if _usable_api(named) else ""
 
 
@@ -1933,9 +2030,9 @@ def _in_flight(cfg: Config) -> bool:
 
 def auto_sign_in(cfg: Config, hook: dict[str, Any]) -> bool:
     """A session start with no usable key opens the sign-in by itself: on a new session (not a
-    resume or a compaction), with a person there to see it, at most once a day and not for a
-    week after Cancel, never while one is open, and never with ALEXEIN_SIGN_IN=0. True when it
-    was started."""
+    resume or a compaction), with a person there to see it, at most once a day and SIGN_IN_TRIES
+    times in all, never again after Cancel, never while one is open, never for an API whose
+    console is not known, and never with ALEXEIN_SIGN_IN=0. True when it was started."""
     if not cfg.host.client or not cfg.signed_out or cfg.paused:
         return False
     if hook.get("source") not in (None, "", "startup"):
@@ -1946,12 +2043,24 @@ def auto_sign_in(cfg: Config, hook: dict[str, Any]) -> bool:
         return False
     last = _read_json(cfg.data / SIGN_IN_STATE, {})
     last = last if isinstance(last, dict) else {}
-    wait = SIGN_IN_DECLINED if last.get("result") == "cancelled" else SIGN_IN_EVERY
-    if last.get("result") == "signed in":
-        wait = 0  # its key was revoked since: a sign-in now is no repeat of an ignored one
+    if last.get("result") == "cancelled":
+        return False  # they said no: only /alexein:sign-in opens it again
+    tries = 0 if last.get("result") == "signed in" else int(last.get("auto_tries") or 0)
+    if tries >= SIGN_IN_TRIES:
+        return False
+    # A signed-in key revoked since: a sign-in now is no repeat of an ignored one.
+    wait = 0 if last.get("result") == "signed in" else SIGN_IN_EVERY
     if _since(last.get("opened_at")) < wait or _in_flight(cfg):
         return False
-    _write_json(cfg.data / SIGN_IN_STATE, {"opened_at": _now(), "by": "session start"})
+    _write_json(
+        cfg.data / SIGN_IN_STATE,
+        {
+            "opened_at": _now(),
+            "by": "session start",
+            "auto_tries": tries + 1,
+            "console": console_url(cfg),
+        },
+    )
     spawn_helper(cfg, "sign-in-helper")
     return True
 
@@ -1960,18 +2069,35 @@ def sign_in(cfg: Config) -> str:
     """/alexein:sign-in: the browser sign-in, started now, whatever the backoff."""
     if not cfg.host.client:
         return f"Signing in through the browser is not available in {cfg.host.name}; set ALEXEIN_API_KEY."
-    if cfg.key and cfg.key_source != "sign-in" and not cfg.refused:
+    # Claude Code runs this in its Bash tool, which has none of the plugin's options: what the
+    # hooks last saw of them is in status.json.
+    shown = _read_json(cfg.data / "status.json", {})
+    shown = shown if isinstance(shown, dict) else {}
+    if cfg.host.id == CLAUDE and not cfg.configured_api and shown.get("api_url"):
+        configured = str(shown["api_url"]).rstrip("/")
+        if shown.get("key_source") != "sign-in" and configured != DEFAULT_API:
+            cfg.configured_api = cfg.api = configured
+    set_by_hand = (cfg.key and cfg.key_source == "set") or (
+        shown.get("key_set") and shown.get("key_source") == "set"
+    )
+    if set_by_hand and not cfg.refused and not shown.get("key_refused"):
         return (
             f"An API key is already set for {cfg.host.name}, and it is the one used. To sign in"
             " instead, remove it from the options first."
         )
     console = console_url(cfg)
     if not console:
-        return "The console address is not usable: https only, or http to this computer."
+        return (
+            f"Signing in through the browser needs the address of the Alexein app for your API"
+            f" ({cfg.configured_api or cfg.api}): set ALEXEIN_CONSOLE_URL to it and run this again,"
+            " or set a personal key from that app's My memory › Keys."
+        )
     if _in_flight(cfg):
         return "A sign-in is already open in your browser. Finish it there, or wait a few minutes."
     cfg.data.mkdir(parents=True, exist_ok=True, mode=0o700)
-    _write_json(cfg.data / SIGN_IN_STATE, {"opened_at": _now(), "by": "asked"})
+    _write_json(
+        cfg.data / SIGN_IN_STATE, {"opened_at": _now(), "by": "asked", "console": console}
+    )
     spawn_helper(cfg, "sign-in-helper")
     return (
         f"Your browser is opening Alexein's sign-in for {cfg.host.name}. Select Allow there:"
@@ -2113,16 +2239,21 @@ def sign_in_helper(cfg: Config, opener: Any = None, wait: float = 0.0) -> str:
     holder = try_lock(cfg.data / "sign-in.lock")
     if holder is None:
         return "busy"
-    console = console_url(cfg)
     began = _read_json(cfg.data / SIGN_IN_STATE, {})
     began = began if isinstance(began, dict) else {}
     began.setdefault("opened_at", _now())
+    # The console its starter chose, which knew the configured API; the helper's own environment
+    # may not (a skill's Bash has no plugin options).
+    console = str(began.get("console") or "") or console_url(cfg)
+    console = console if _usable_api(console) else ""
     verifier = _b64(secrets.token_bytes(32))
     challenge = _b64(hashlib.sha256(verifier.encode("ascii")).digest())
     state = _b64(secrets.token_bytes(16))
     outcome: dict[str, str] = {}
 
     class Callback(http.server.BaseHTTPRequestHandler):
+        timeout = 5  # a connection that sends nothing does not hold the sign-in up
+
         def log_message(self, *_: Any) -> None:  # nothing about the request is printed
             return None
 
@@ -2141,7 +2272,8 @@ def sign_in_helper(cfg: Config, opener: Any = None, wait: float = 0.0) -> str:
             asked = dict(urllib.parse.parse_qsl(url.query))
             if url.path != "/callback":
                 return self._answer(404)
-            if not secrets.compare_digest(asked.get("state", ""), state) or outcome:
+            given = asked.get("state", "").encode("utf-8")
+            if not secrets.compare_digest(given, state.encode("ascii")) or outcome:
                 return self._answer(400)
             done = f"{console}/desktop/signed-in?client={cfg.host.client}"
             if asked.get("error"):
@@ -2253,7 +2385,15 @@ def status(cfg: Config) -> str:
     if kept and not kept_refused and (not shown.get("key_set") or (by_sign_in and refused)):
         # Signed in since the hooks last ran: the key is used from the next message.
         shown, refused, by_sign_in = {**shown, "key_set": True}, None, True
-    if "key_set" not in shown:
+    if shown.get("key_project") and not by_sign_in:
+        key = (
+            "the key set is not a personal key (a project's key, say), so the hooks do not use"
+            " it: with it, your sessions would be saved to an app user of that project. Make a"
+            f" personal key under My memory › Keys, or sign in with {_sign_in_how(cfg)}"
+        )
+        saving = "off (needs a personal key or a sign-in)"
+        shown = {**shown, "key_set": False}
+    elif "key_set" not in shown:
         key = "unknown until the next session starts"
     elif not shown["key_set"]:
         key = (
@@ -2348,6 +2488,8 @@ def main(argv: list[str]) -> int:
         if host not in HOSTS or action not in HOOKS | COMMANDS:
             return 0
         cfg = Config(data=data, host=host)
+        if (action in HOOKS or action == "send") and check_key(cfg):
+            cfg = Config(env=cfg.env, data=data, host=host)  # with what the API said of the key
         if action in COMMANDS:
             if action == "send":
                 send(cfg)
